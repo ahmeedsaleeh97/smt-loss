@@ -211,7 +211,7 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # CONSTANTS & PLAYBOOK
 # ----------------------------------------------------------------------------
 MAJOR_LOSS_THRESHOLD_MIN = 5.0
-UPLOAD_TYPES = ["csv", "xlsx", "xls", "txt"]
+UPLOAD_TYPES = ["csv", "xlsx", "xls"]
 IMAGE_TYPES = ["png", "jpg", "jpeg"]
 
 STOPPAGE_PLAYBOOK = {
@@ -444,9 +444,13 @@ def load_uploaded_table(uploaded_file):
 # ----------------------------------------------------------------------------
 # BLOCK4 LINE DETECTION
 # ----------------------------------------------------------------------------
+# BLOCK4 01-04 are also known on the shop floor as NXT01-04 / NXT1-4 (the
+# mounter model line name) — both naming conventions map to the same
+# canonical "BLOCK4 0X" label used throughout the app.
 BLOCK_PATTERNS = [
     r"block\s*4\s*[-_ ]?\s*0?(\d{1,2})",
     r"\bb4[-_ ]?0?(\d{1,2})\b",
+    r"\bnxt[-_ ]?0?(\d{1,2})\b",
     r"\bblock\s*[-_ ]?0?(\d{1,2})\b",
     r"\bline\s*[-_ ]?0?(\d{1,2})\b",
     r"\bL[-_ ]?0?(\d{1,2})\b",
@@ -472,7 +476,7 @@ def normalize_to_block(text):
 
 
 def detect_block_column(df):
-    col = find_column(df, must_contain_any=["line", "block"])
+    col = find_column(df, must_contain_any=["line", "block", "nxt"])
     if col is not None:
         return "direct", col
     for kw in ["machine", "equipment", "model", "mounter", "station", "eqp"]:
@@ -635,9 +639,17 @@ def parse_major_loss_pasted(pasted_text, manual_unit_hint="min"):
 # (an HH:MM:SS string) when both are present, since it needs no time-string
 # parsing at all. `Detail` (free-text alarm/remark detail) is captured for
 # the raw-data drill-down view but doesn't affect any calculation.
-def parse_sw_log_sheets(sheets, kind="sheets"):
+def parse_sw_log_sheets(sheets, kind="sheets", forced_line=None):
     """Core parser: takes a dict[sheet_name -> DataFrame] (from a workbook,
-    a single uploaded table wrapped as {'Data': df}, or pasted-text tabs)."""
+    a single uploaded table wrapped as {'Data': df}, or pasted-text tabs).
+
+    When `forced_line` is given (the Ver 2.1 per-line modular upload model),
+    every parsed row is tagged with that line directly — no cross-line
+    ambiguity is possible since the upload is already scoped to one line.
+    Any Line/Machine column found is still scanned as a sanity cross-check
+    and surfaced as a warning if it disagrees with `forced_line`, but it
+    never overrides the forced assignment.
+    """
     warnings, errors = [], []
 
     event_sheet_name = None
@@ -686,12 +698,29 @@ def parse_sw_log_sheets(sheets, kind="sheets"):
             warnings.append(f"Sheet '{event_sheet_name}': could not locate column(s) {', '.join(missing)}.")
 
         if duration_sec_series is not None and status_col is not None:
-            line_series, line_col = build_block_series(raw1)
-            matched_count = line_series.notna().sum()
-            if line_col is not None:
-                warnings.append(f"Line identifiers scanned in column '{line_col}' of the SW Log — matched {matched_count} of {len(raw1)} row(s).")
+            if forced_line is not None:
+                # Per-line modular upload: assign every row to the known target line.
+                # Still scan for a Line/Machine identifier column purely as a data-integrity
+                # cross-check — a mismatch likely means the wrong file was uploaded here.
+                detected_series, detected_col = build_block_series(raw1)
+                detected_non_null = detected_series.dropna()
+                if detected_col is not None and len(detected_non_null) > 0:
+                    mismatch_rate = (detected_non_null != forced_line).mean()
+                    if mismatch_rate > 0.5:
+                        majority_line = detected_non_null.mode().iloc[0] if not detected_non_null.mode().empty else "an unrecognized line"
+                        warnings.append(
+                            f"⚠️ Data-integrity check: most rows in column '{detected_col}' look like they belong to "
+                            f"{majority_line}, not {forced_line}. Please double-check you uploaded the correct file "
+                            f"for {forced_line}."
+                        )
+                line_series = pd.Series([forced_line] * len(raw1), index=raw1.index)
             else:
-                warnings.append("Could not find BLOCK4/line identifiers in the SW Log — all events are 'Unmatched'.")
+                line_series, line_col = build_block_series(raw1)
+                matched_count = line_series.notna().sum()
+                if line_col is not None:
+                    warnings.append(f"Line identifiers scanned in column '{line_col}' of the SW Log — matched {matched_count} of {len(raw1)} row(s).")
+                else:
+                    warnings.append("Could not find BLOCK4/line identifiers in the SW Log — all events are 'Unmatched'.")
             warnings.append(f"Stoppage duration read from column {duration_source}.")
             stoppage_df = pd.DataFrame({
                 "Machine": raw1[machine_col].astype(str) if machine_col is not None else "N/A",
@@ -702,7 +731,8 @@ def parse_sw_log_sheets(sheets, kind="sheets"):
                 "Line": line_series,
             })
             stoppage_df = stoppage_df.dropna(subset=["Duration_Sec"])
-            stoppage_df["Line"] = stoppage_df["Line"].fillna("Unmatched")
+            if forced_line is None:
+                stoppage_df["Line"] = stoppage_df["Line"].fillna("Unmatched")
             if stoppage_df.empty:
                 stoppage_df = None
                 warnings.append(f"No valid duration rows found in sheet '{event_sheet_name}'.")
@@ -761,23 +791,25 @@ def parse_sw_log_sheets(sheets, kind="sheets"):
             "warnings": warnings, "errors": errors}
 
 
-def parse_sw_log_file(uploaded_file):
-    """Load an uploaded SW Log file (.xlsx multi-sheet, or .csv/.txt single table) and parse it."""
+def parse_sw_log_file(uploaded_file, forced_line=None):
+    """Load an uploaded SW Log file (.xlsx multi-sheet, or .csv/.xls/.txt single table) and parse it.
+    Pass `forced_line` (e.g. "BLOCK4 01") for the Ver 2.1 per-line modular upload model."""
     try:
         payload, kind, meta = load_uploaded_table(uploaded_file)
     except Exception as e:
         return {"ok": False, "stoppage_df": None, "status_df": None, "module_df": None,
                 "warnings": [], "errors": [f"Could not read the Machine SW Log file: {e}"]}
     sheets = payload if kind == "sheets" else {"Data": payload}
-    return parse_sw_log_sheets(sheets, kind=kind)
+    return parse_sw_log_sheets(sheets, kind=kind, forced_line=forced_line)
 
 
-def parse_sw_log_pasted(stoppage_text, status_text=None, module_text=None):
+def parse_sw_log_pasted(stoppage_text, status_text=None, module_text=None, forced_line=None):
     """Parse SW Log data pasted as raw text. `stoppage_text` (the event-level
     tab) is required; `status_text` and `module_text` (pre-aggregated tabs)
     are optional extras — the app can self-aggregate from the event-level
     data alone, but pasting them too lets the fallback path use them if the
-    event-level tab is malformed."""
+    event-level tab is malformed. Pass `forced_line` for the per-line modular
+    upload model."""
     sheets = {}
     warnings = []
     try:
@@ -801,7 +833,7 @@ def parse_sw_log_pasted(stoppage_text, status_text=None, module_text=None):
         except Exception as e:
             warnings.append(f"Could not parse the pasted Stoppage(Module) text — ignored: {e}")
 
-    result = parse_sw_log_sheets(sheets, kind="sheets")
+    result = parse_sw_log_sheets(sheets, kind="sheets", forced_line=forced_line)
     result["warnings"] = warnings + result["warnings"]
     return result
 
@@ -1211,7 +1243,7 @@ tabs = st.tabs(tab_labels)
 # DATA INPUT & LOG ANALYSIS TAB — upload OR paste, for both log files
 # ----------------------------------------------------------------------------
 major_loss_result = None
-sw_log_result = None
+sw_log_results = {}  # dict[line] -> parse result, populated per-line inside tabs[0] below
 
 with tabs[0]:
     st.markdown("""<div class="section-card"><div class="section-title">📁 MES Major Loss Register (&gt; 5 min)</div>
@@ -1255,53 +1287,64 @@ with tabs[0]:
             st.dataframe(major_loss_result["df"].head(50), use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("""<div class="section-card"><div class="section-title">📁 Machine SW Stoppage Log</div>
-        <div class="section-caption">Stoppage: Start · End · Span · Time(min) · Machine · Module · Status · Detail. Stoppage(Status) &amp; Stoppage(Module) are optional aggregated tabs.</div>""",
+    st.markdown("""<div class="section-card"><div class="section-title">📁 Machine SW Stoppage Log — Per-Line Modular Upload</div>
+        <div class="section-caption">Each line (BLOCK4 01–04, also recognized as NXT01–04 / NXT1–4) has its own dedicated input below.
+        Stoppage: Start · End · Span · Time(min) · Machine · Module · Status · Detail. Stoppage(Status) &amp; Stoppage(Module) are optional aggregated tabs.</div>""",
                 unsafe_allow_html=True)
 
-    sw_input_mode = st.radio("Input method", ["Upload File", "Paste Text"], horizontal=True, key="sw_input_mode")
-    if sw_input_mode == "Upload File":
-        sw_log_file = st.file_uploader("Upload Machine SW Log (.xlsx multi-sheet, .csv, or .txt)",
-                                        type=UPLOAD_TYPES, key="sw_log_upl")
-        if sw_log_file is not None:
-            try:
-                sw_log_result = parse_sw_log_file(sw_log_file)
-            except Exception as e:
-                sw_log_result = {"ok": False, "stoppage_df": None, "status_df": None, "module_df": None, "warnings": [],
-                                  "errors": [f"Unexpected error while parsing SW Log file: {e}"]}
-    else:
-        paste_tabs = st.tabs(["Stoppage (required)", "Stoppage(Status) (optional)", "Stoppage(Module) (optional)"])
-        with paste_tabs[0]:
-            sw_stoppage_pasted = st.text_area(
-                "Paste event-level Stoppage data (include the header row)",
-                height=180, key="sw_stoppage_paste",
-                placeholder="Start\tEnd\tSpan\tTime(min)\tMachine\tModule\tStatus\tDetail\n08:00:00\t08:02:30\t00:02:30\t2.5\tBLOCK4 01-M1\tHead1\tWait Previous\tUpstream empty",
-            )
-        with paste_tabs[1]:
-            sw_status_pasted = st.text_area("Paste Stoppage(Status) data (optional)", height=140, key="sw_status_paste")
-        with paste_tabs[2]:
-            sw_module_pasted = st.text_area("Paste Stoppage(Module) data (optional)", height=140, key="sw_module_paste")
+    sw_log_results = {}
+    line_upload_tabs = st.tabs([f"📍 {l}" for l in LINE_NAMES])
+    for line, line_tab in zip(LINE_NAMES, line_upload_tabs):
+        with line_tab:
+            line_key = re.sub(r"[^a-zA-Z0-9]", "_", line)
+            line_result = None
+            input_mode = st.radio("Input method", ["Upload File", "Paste Text"], horizontal=True, key=f"sw_input_mode_{line_key}")
 
-        if st.button("Parse Pasted SW Log Text", key="sw_log_paste_btn"):
-            try:
-                sw_log_result = parse_sw_log_pasted(sw_stoppage_pasted, sw_status_pasted, sw_module_pasted)
-                st.session_state["_sw_log_result_cache"] = sw_log_result
-            except Exception as e:
-                sw_log_result = {"ok": False, "stoppage_df": None, "status_df": None, "module_df": None, "warnings": [],
-                                  "errors": [f"Unexpected error while parsing pasted SW Log text: {e}"]}
-                st.session_state["_sw_log_result_cache"] = sw_log_result
-        elif "_sw_log_result_cache" in st.session_state:
-            sw_log_result = st.session_state["_sw_log_result_cache"]
+            if input_mode == "Upload File":
+                up_file = st.file_uploader(f"Upload SW Log for {line} (.xlsx multi-sheet, .xls, or .csv)",
+                                            type=UPLOAD_TYPES, key=f"sw_log_upl_{line_key}")
+                if up_file is not None:
+                    try:
+                        line_result = parse_sw_log_file(up_file, forced_line=line)
+                    except Exception as e:
+                        line_result = {"ok": False, "stoppage_df": None, "status_df": None, "module_df": None, "warnings": [],
+                                        "errors": [f"Unexpected error while parsing SW Log file for {line}: {e}"]}
+            else:
+                paste_sub_tabs = st.tabs(["Stoppage (required)", "Stoppage(Status) (optional)", "Stoppage(Module) (optional)"])
+                with paste_sub_tabs[0]:
+                    stoppage_pasted = st.text_area(
+                        f"Paste event-level Stoppage data for {line} (include the header row)",
+                        height=160, key=f"sw_stoppage_paste_{line_key}",
+                        placeholder=f"Start\tEnd\tSpan\tTime(min)\tMachine\tModule\tStatus\tDetail\n08:00:00\t08:02:30\t00:02:30\t2.5\t{line}-M1\tHead1\tWait Previous\tUpstream empty",
+                    )
+                with paste_sub_tabs[1]:
+                    status_pasted = st.text_area(f"Paste Stoppage(Status) data for {line} (optional)", height=120, key=f"sw_status_paste_{line_key}")
+                with paste_sub_tabs[2]:
+                    module_pasted = st.text_area(f"Paste Stoppage(Module) data for {line} (optional)", height=120, key=f"sw_module_paste_{line_key}")
 
-    for err in (sw_log_result or {}).get("errors", []):
-        st.error(f"**Machine SW Log file:** {err}")
-    for warn in (sw_log_result or {}).get("warnings", []):
-        st.warning(f"**Machine SW Log file:** {warn}")
-    if sw_log_result and sw_log_result.get("ok"):
-        st.success(f"Parsed stoppage-by-status summary with {len(sw_log_result['status_df'])} categor(y/ies).")
-        with st.expander("Preview parsed Stoppage(Status) summary"):
-            st.dataframe(sw_log_result["status_df"].head(50), use_container_width=True)
+                if st.button(f"Parse Pasted SW Log Text — {line}", key=f"sw_log_paste_btn_{line_key}"):
+                    try:
+                        line_result = parse_sw_log_pasted(stoppage_pasted, status_pasted, module_pasted, forced_line=line)
+                        st.session_state[f"_sw_log_result_cache_{line_key}"] = line_result
+                    except Exception as e:
+                        line_result = {"ok": False, "stoppage_df": None, "status_df": None, "module_df": None, "warnings": [],
+                                        "errors": [f"Unexpected error while parsing pasted SW Log text for {line}: {e}"]}
+                        st.session_state[f"_sw_log_result_cache_{line_key}"] = line_result
+                elif f"_sw_log_result_cache_{line_key}" in st.session_state:
+                    line_result = st.session_state[f"_sw_log_result_cache_{line_key}"]
+
+            for err in (line_result or {}).get("errors", []):
+                st.error(f"**{line} SW Log:** {err}")
+            for warn in (line_result or {}).get("warnings", []):
+                st.warning(f"**{line} SW Log:** {warn}")
+            if line_result and line_result.get("ok"):
+                st.success(f"{line}: parsed stoppage-by-status summary with {len(line_result['status_df'])} categor(y/ies).")
+                with st.expander(f"Preview parsed data — {line}"):
+                    st.dataframe(line_result["status_df"].head(50), use_container_width=True)
+
+            sw_log_results[line] = line_result
     st.markdown("</div>", unsafe_allow_html=True)
+
 
     with st.expander("🧪 Duration Conversion Helper"):
         st.caption("Quickly check how a raw duration value from your file would be parsed.")
@@ -1313,13 +1356,11 @@ with tabs[0]:
             else:
                 st.info(f"→ {parsed_sec:,.1f} seconds  •  {parsed_sec/60:,.2f} minutes  •  {seconds_to_hms(parsed_sec)}")
 
-# major_loss_result / sw_log_result were populated inside the "📁 Data Input &
-# Log Analysis" tab above (whichever of Upload/Paste the user chose).
+# major_loss_result / sw_log_results were populated inside the "📁 Data Input &
+# Log Analysis" tab above (whichever of Upload/Paste the user chose, per line).
 major_df = major_loss_result["df"] if (major_loss_result and major_loss_result.get("ok")) else None
 if major_df is not None and shift_select != "All Shifts" and "Shift" in major_df.columns and major_df["Shift"].notna().any():
     major_df = major_df[major_df["Shift"].str.strip().str.lower() == shift_select.strip().lower()]
-
-stoppage_df_all = sw_log_result["stoppage_df"] if (sw_log_result and sw_log_result.get("ok")) else None
 
 major_loss_source = (f"From parsed input ({len(major_df)} loss event(s) after Shift filter)" if major_df is not None
                       else "No Major Loss data provided yet — treated as 0 min")
@@ -1339,6 +1380,7 @@ def compute_metrics(loading_min, working_min, major_loss_min):
 line_metrics = {}
 line_status_dfs = {}
 line_module_dfs = {}
+line_stoppage_dfs = {}
 
 for line in LINE_NAMES:
     line_loading_min = line_inputs[line]["loading_min"]
@@ -1347,11 +1389,13 @@ for line in LINE_NAMES:
                             if (major_df is not None and (major_df["Line"] == line).any()) else 0.0)
     line_metrics[line] = compute_metrics(line_loading_min, line_working_min, line_major_loss_min)
 
-    if stoppage_df_all is not None and (stoppage_df_all["Line"] == line).any():
-        line_stoppage_df = stoppage_df_all[stoppage_df_all["Line"] == line]
-        line_status_dfs[line] = aggregate_status(line_stoppage_df)
-        line_module_dfs[line] = aggregate_module(line_stoppage_df)
+    line_result = sw_log_results.get(line)
+    if line_result and line_result.get("ok"):
+        line_stoppage_dfs[line] = line_result["stoppage_df"]
+        line_status_dfs[line] = line_result["status_df"]
+        line_module_dfs[line] = line_result["module_df"]
     else:
+        line_stoppage_dfs[line] = None
         line_status_dfs[line] = None
         line_module_dfs[line] = None
 
@@ -1360,17 +1404,14 @@ overall_working_min = sum(m["working"] for m in line_metrics.values())
 overall_major_loss_min = sum(m["major"] for m in line_metrics.values())
 overall_metrics = compute_metrics(overall_loading_min, overall_working_min, overall_major_loss_min)
 
-if stoppage_df_all is not None:
-    matched_stoppage_all = stoppage_df_all[stoppage_df_all["Line"].isin(LINE_NAMES)]
-    unmatched_events = int((stoppage_df_all["Line"] == "Unmatched").sum())
-    if unmatched_events > 0:
-        st.caption(f"⚠️ {unmatched_events} SW stoppage event(s) could not be matched to a BLOCK4 line and are excluded from per-line/plant Pareto & Action Plan views.")
-    overall_status_df = aggregate_status(matched_stoppage_all)
-    overall_module_df = aggregate_module(matched_stoppage_all)
-elif sw_log_result and sw_log_result.get("ok"):
-    overall_status_df = sw_log_result["status_df"]
-    overall_module_df = sw_log_result["module_df"]
+# Overall plant Pareto/action-plan data = union of every line's already-tagged stoppage events.
+all_stoppage_frames = [df for df in line_stoppage_dfs.values() if df is not None and not df.empty]
+if all_stoppage_frames:
+    stoppage_df_all = pd.concat(all_stoppage_frames, ignore_index=True)
+    overall_status_df = aggregate_status(stoppage_df_all)
+    overall_module_df = aggregate_module(stoppage_df_all)
 else:
+    stoppage_df_all = None
     overall_status_df, overall_module_df = None, None
 
 # (The "Save Today's Records to Database" control lives inside the Overall
@@ -1632,8 +1673,8 @@ for i, line in enumerate(LINE_NAMES, start=2):
     with tabs[i]:
         if major_df is not None and not (major_df["Line"] == line).any():
             st.caption(f"⚠️ No Major Loss rows were matched to {line} in the parsed input — showing 0 min.")
-        if stoppage_df_all is not None and not (stoppage_df_all["Line"] == line).any():
-            st.caption(f"⚠️ No SW stoppage events were matched to {line} — Pareto/Hot Issues/Action Plan unavailable for it.")
+        if line_stoppage_dfs.get(line) is None:
+            st.caption(f"⚠️ No SW stoppage data has been uploaded/pasted for {line} yet — Pareto/Hot Issues/Action Plan unavailable for it.")
 
         m = line_metrics[line]
         st.markdown(f"""<div class="section-card"><div class="section-title">🌊 Time Breakup Waterfall — {line}</div>
@@ -1838,3 +1879,4 @@ st.markdown(
     f"Local SQLite database: <code>{DB_PATH}</code>.</p>",
     unsafe_allow_html=True,
 )
+
